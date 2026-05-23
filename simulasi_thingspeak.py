@@ -1,7 +1,9 @@
 """
 Simulasi Data Sensor → ThingSpeak
-NH3 + Suhu Air — Realistis 24 Jam Penuh
-Deploy di Railway.app
+NH3 + Suhu Air — Ritme REALISTIS sesuai lapangan
+- Suhu berubah sangat lambat (massa air besar)
+- Amonia berubah perlahan (proses biologis)
+- Spike pakan naik 15-30 menit, turun 1-2 jam
 """
 
 import requests
@@ -14,47 +16,95 @@ from datetime import datetime
 #  KONFIGURASI
 # ══════════════════════════════════════════════════════════════════════
 WRITE_API_KEY = "P3PP9Q26O82TB41R"
-TS_URL        = "https://api.thingspeak.com/update"
-INTERVAL      = 20  # detik antar kirim (minimum 15)
+TS_URL        = "https://api.thingspeak.com/update.json"
+INTERVAL      = 20  # detik antar kirim
 
 # ══════════════════════════════════════════════════════════════════════
-#  SIMULASI SUHU AIR
-#  - Dingin jam 04.00-05.00 subuh (~26°C)
-#  - Panas  jam 13.00-15.00 siang (~31°C)
+#  SIMULASI SUHU — SANGAT LAMBAT (massa air besar)
+#
+#  Siklus 24 jam nyata:
+#  04.00 = 26.0°C (paling dingin)
+#  14.00 = 31.0°C (paling panas)
+#  Perubahan ~0.0014°C per detik = 5°C dalam 1 jam
 # ══════════════════════════════════════════════════════════════════════
+suhu_state = {"nilai": None}
+
 def hitung_suhu(jam_desimal):
-    fase = (jam_desimal - 4) / 24 * 2 * math.pi
-    suhu = 28.0 + 2.5 * math.sin(fase) + random.gauss(0, 0.15)
-    return round(max(24.0, min(34.0, suhu)), 2)
+    # Target suhu berdasarkan jam (siklus sinus 24 jam)
+    # Puncak panas jam 14.00, paling dingin jam 04.00
+    fase   = (jam_desimal - 4.0) / 24.0 * 2.0 * math.pi
+    target = 28.0 + 2.5 * math.sin(fase)
+    target = max(24.0, min(34.0, target))
+
+    # Inisialisasi pertama
+    if suhu_state["nilai"] is None:
+        suhu_state["nilai"] = target
+
+    # Smoothing sangat lambat — 0.001 per tick (20 detik)
+    # Artinya perubahan 1°C butuh ~1000 tick = ~333 menit ≈ 5.5 jam
+    # Lebih realistis untuk massa air kolam besar
+    alpha = 0.001
+    suhu_state["nilai"] += (target - suhu_state["nilai"]) * alpha
+
+    # Tambah noise kecil sensor (±0.05°C)
+    noise = random.gauss(0, 0.05)
+    return round(suhu_state["nilai"] + noise, 2)
+
 
 # ══════════════════════════════════════════════════════════════════════
-#  SIMULASI AMONIA (NH3)
-#  - Tinggi subuh  (bakteri nitrifikasi tidak aktif)
-#  - Turun siang   (fotosintesis alga menyerap NH3)
-#  - Spike jam 07.00 & 17.00 (setelah pakan)
-#  - Suhu tinggi = amonia lebih tinggi
+#  SIMULASI AMONIA — LAMBAT (proses biologis)
+#
+#  Pola harian nyata:
+#  - Subuh (04-06): paling tinggi ~0.25 ppm
+#  - Siang (12-14): paling rendah ~0.05 ppm
+#  - Naik lagi malam: ~0.15 ppm
+#  - Spike setelah pakan: naik 0.1 ppm dalam 20 menit,
+#    turun kembali dalam 1-2 jam
 # ══════════════════════════════════════════════════════════════════════
-nh3_state = {"nilai": 0.15, "tren": 0.0}
+nh3_state = {"nilai": None, "tren": 0.0}
 
 def hitung_nh3(jam_desimal, suhu):
-    fase_nh3    = (jam_desimal - 5) / 24 * 2 * math.pi
-    pola_hari   = 0.10 * (-math.cos(fase_nh3))
-    faktor_suhu = 1.0 + 0.07 * (suhu - 28.0)
+    # Target berdasarkan pola harian
+    # Puncak subuh jam 05, rendah jam 13
+    fase_nh3  = (jam_desimal - 5.0) / 24.0 * 2.0 * math.pi
+    pola_hari = 0.10 * (-math.cos(fase_nh3))
 
+    # Pengaruh suhu (kimia nyata: suhu tinggi = NH3 bebas lebih banyak)
+    faktor_suhu = 1.0 + 0.05 * (suhu - 28.0)
+
+    # Spike setelah pakan jam 07.00 dan 17.00
+    # Naik dalam 20 menit, turun dalam 90 menit
     spike = 0.0
-    if (6.9 < jam_desimal < 7.5) or (16.9 < jam_desimal < 17.5):
-        menit_lewat = (jam_desimal % 1) * 60
-        spike = 0.08 * math.exp(-((menit_lewat - 5) ** 2) / 30)
+    for jam_pakan in [7.0, 17.0]:
+        selisih_jam = jam_desimal - jam_pakan
+        if 0 <= selisih_jam <= 2.0:  # dalam 2 jam setelah pakan
+            # Naik cepat 20 menit pertama, turun lambat sampai 2 jam
+            selisih_menit = selisih_jam * 60
+            if selisih_menit <= 20:
+                spike += 0.10 * (selisih_menit / 20)  # naik linear
+            else:
+                spike += 0.10 * math.exp(-(selisih_menit - 20) / 40)  # turun eksponensial
 
-    noise = random.gauss(0, 0.008)
-    nh3_state["tren"] += random.gauss(0, 0.001)
-    nh3_state["tren"]  = max(-0.02, min(0.02, nh3_state["tren"]))
+    # Tren biologis acak sangat lambat
+    nh3_state["tren"] += random.gauss(0, 0.0002)
+    nh3_state["tren"]  = max(-0.01, min(0.01, nh3_state["tren"]))
 
-    target = (0.15 + pola_hari + spike + nh3_state["tren"] + noise) * faktor_suhu
-    target = max(0.005, min(1.5, target))
+    target = (0.10 + pola_hari + spike + nh3_state["tren"]) * faktor_suhu
+    target = max(0.005, min(1.0, target))
 
-    nh3_state["nilai"] += (target - nh3_state["nilai"]) * 0.25
-    return round(nh3_state["nilai"], 4)
+    # Inisialisasi pertama
+    if nh3_state["nilai"] is None:
+        nh3_state["nilai"] = target
+
+    # Smoothing lambat — proses biologis tidak instan
+    # 0.002 per tick = perubahan 0.1 ppm butuh ~50 tick = ~17 menit
+    alpha = 0.002
+    nh3_state["nilai"] += (target - nh3_state["nilai"]) * alpha
+
+    # Noise kecil sensor (±0.002 ppm)
+    noise = random.gauss(0, 0.002)
+    return round(max(0.001, nh3_state["nilai"] + noise), 4)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  STATUS
@@ -72,19 +122,26 @@ def status_suhu(c):
     elif c > 32:       return "Berbahaya"
     else:              return "Terlalu Panas"
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  KIRIM KE THINGSPEAK
 # ══════════════════════════════════════════════════════════════════════
 def kirim(nh3, suhu):
     try:
-        r = requests.get(TS_URL, params={
+        payload = {
             "api_key": WRITE_API_KEY,
-            "field1" : nh3,
-            "field2" : suhu,
-        }, timeout=10)
+            "field1" : str(nh3),
+            "field2" : str(suhu),
+        }
+        r = requests.post(
+            TS_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
         if r.status_code == 200 and r.text.strip() not in ("0", ""):
-            return True, int(r.text.strip())
-        return False, f"HTTP {r.status_code}"
+            return True, r.text.strip()
+        return False, f"HTTP {r.status_code} body={r.text.strip()[:30]}"
     except requests.exceptions.ConnectionError:
         return False, "Tidak ada koneksi"
     except requests.exceptions.Timeout:
@@ -92,24 +149,30 @@ def kirim(nh3, suhu):
     except Exception as e:
         return False, str(e)
 
+
 # ══════════════════════════════════════════════════════════════════════
-#  MAIN — jalan terus tanpa batas (Railway mengelola prosesnya)
+#  MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    print("=" * 60)
+    print("=" * 65)
     print("  Simulasi Sensor Air → ThingSpeak")
-    print(f"  Mulai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Mulai  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  API    : {WRITE_API_KEY}")
     print(f"  Interval: {INTERVAL} detik")
-    print("  Mode: 24 JAM PENUH (Railway worker)")
-    print("=" * 60)
+    print()
+    print("  Ritme realistis:")
+    print("  Suhu  → berubah sangat lambat (~5°C dalam 5-6 jam)")
+    print("  NH3   → berubah lambat, spike 20 menit setelah pakan")
+    print("          (jam 07.00 dan 17.00)")
+    print("=" * 65)
 
     total = 0
     gagal = 0
 
     while True:
-        now         = datetime.now()
-        jam         = now.hour + now.minute / 60 + now.second / 3600
-        waktu_str   = now.strftime("%H:%M:%S")
+        now       = datetime.now()
+        jam       = now.hour + now.minute / 60 + now.second / 3600
+        waktu_str = now.strftime("%H:%M:%S")
 
         suhu = hitung_suhu(jam)
         nh3  = hitung_nh3(jam, suhu)
@@ -118,15 +181,16 @@ def main():
         total += 1
 
         if sukses:
-            gagal_pct = (gagal / total * 100) if total > 0 else 0
-            print(f"[{waktu_str}] NH3={nh3:.4f}ppm ({status_nh3(nh3)}) | "
-                  f"Suhu={suhu:.2f}C ({status_suhu(suhu)}) | "
-                  f"OK #{info} | total={total} gagal={gagal_pct:.1f}%")
+            print(f"[{waktu_str}] "
+                  f"NH3={nh3:.4f}ppm ({status_nh3(nh3):11}) | "
+                  f"Suhu={suhu:.2f}C ({status_suhu(suhu):14}) | "
+                  f"OK #{info} | total={total} gagal={gagal}")
         else:
             gagal += 1
-            print(f"[{waktu_str}] GAGAL [{info}] | total={total}")
+            print(f"[{waktu_str}] GAGAL [{info}] | total={total} gagal={gagal}")
 
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
     main()
+
